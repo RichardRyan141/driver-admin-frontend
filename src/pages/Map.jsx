@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, CircleMarker } from 'react-leaflet';
 import L from 'leaflet';
 import { locationsAPI, driversAPI, deliveriesAPI } from '../services/api';
-import { Navigation, User, Package, Clock, MapPin, RefreshCw, X, AlertCircle } from 'lucide-react';
+import { Navigation, User, Package, Clock, MapPin, RefreshCw, X, AlertCircle, History, Calendar, Eye, EyeOff } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 
 // Fix Leaflet default marker icon issue
@@ -14,7 +14,7 @@ L.Icon.Default.mergeOptions({
 });
 
 // Custom marker icons
-const createDriverIcon = (status) => {
+const createDriverIcon = (status, isLatest = true) => {
   const colors = {
     online: '#10b981',
     offline: '#6b7280',
@@ -22,22 +22,25 @@ const createDriverIcon = (status) => {
   };
   
   const color = colors[status] || colors.offline;
+  const size = isLatest ? 40 : 28;
+  const iconSize = isLatest ? 20 : 16;
   
   return L.divIcon({
     className: 'custom-driver-marker',
     html: `
       <div style="
         background-color: ${color};
-        width: 32px;
-        height: 32px;
+        width: ${size}px;
+        height: ${size}px;
         border-radius: 50%;
-        border: 3px solid white;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        border: ${isLatest ? '4px' : '3px'} solid white;
+        box-shadow: 0 3px 12px rgba(0,0,0,0.4);
         display: flex;
         align-items: center;
         justify-content: center;
+        ${!isLatest ? 'opacity: 0.7;' : ''}
       ">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="white">
+        <svg width="${iconSize}" height="${iconSize}" viewBox="0 0 24 24" fill="white">
           <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
           <circle cx="9" cy="7" r="4"></circle>
           <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
@@ -45,9 +48,9 @@ const createDriverIcon = (status) => {
         </svg>
       </div>
     `,
-    iconSize: [32, 32],
-    iconAnchor: [16, 16],
-    popupAnchor: [0, -16],
+    iconSize: [size, size],
+    iconAnchor: [size/2, size/2],
+    popupAnchor: [0, -size/2],
   });
 };
 
@@ -90,38 +93,71 @@ const RecenterMap = ({ center }) => {
 
 const Map = () => {
   const [drivers, setDrivers] = useState([]);
-  const [locations, setLocations] = useState([]);
+  const [driverLocations, setDriverLocations] = useState({});
   const [deliveries, setDeliveries] = useState([]);
   const [selectedDriver, setSelectedDriver] = useState(null);
+  const [visibleDrivers, setVisibleDrivers] = useState(new Set());
+  const [selectedDate, setSelectedDate] = useState('');
   const [loading, setLoading] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [showOffline, setShowOffline] = useState(true);
+  const [showLocationHistory, setShowLocationHistory] = useState(true);
   const mapRef = useRef(null);
 
   // Default center (Surabaya, Indonesia)
   const defaultCenter = [-7.2575, 112.7521];
   const [mapCenter, setMapCenter] = useState(defaultCenter);
 
-  // Move fetchData before useEffect
+  // Set default date to today
+  useEffect(() => {
+    const today = new Date().toISOString().split('T')[0];
+    setSelectedDate(today);
+  }, []);
+
   const fetchData = useCallback(async () => {
     try {
-      const [driversRes, locationsRes, deliveriesRes] = await Promise.all([
+      const [driversRes, deliveriesRes] = await Promise.all([
         driversAPI.getAll(),
-        locationsAPI.getAllLocations(),
         deliveriesAPI.getAll()
       ]);
 
-      setDrivers(driversRes.data);
-      setLocations(locationsRes.data || []);
+      const driversData = driversRes.data;
+      setDrivers(driversData);
       setDeliveries(deliveriesRes.data);
+
+      // Initialize visible drivers to all drivers
+      if (visibleDrivers.size === 0) {
+        setVisibleDrivers(new Set(driversData.map(d => d.id)));
+      }
+
+      // Fetch location history for each driver
+      const locationPromises = driversData.map(async (driver) => {
+        try {
+          const locationRes = await locationsAPI.getDriverLocation(driver.id);
+          return { driverId: driver.id, data: locationRes.data };
+        } catch (error) {
+          console.error(`Error fetching location for driver ${driver.id}:`, error);
+          return { driverId: driver.id, data: null };
+        }
+      });
+
+      const locationsResults = await Promise.all(locationPromises);
+      const locationsMap = {};
+      locationsResults.forEach(result => {
+        if (result.data && result.data.logs) {
+          locationsMap[result.driverId] = result.data.logs;
+        }
+      });
+
+      setDriverLocations(locationsMap);
       setLastUpdate(new Date());
       setLoading(false);
     } catch (error) {
       console.error('Error fetching map data:', error);
       setLoading(false);
     }
-  }, []);
+  }, [visibleDrivers.size]);
 
   useEffect(() => {
     fetchData();
@@ -130,7 +166,7 @@ const Map = () => {
     if (autoRefresh) {
       interval = setInterval(() => {
         fetchData();
-      }, 10000); // Update every 10 seconds
+      }, 30000); // Update every 30 seconds
     }
 
     return () => {
@@ -138,8 +174,49 @@ const Map = () => {
     };
   }, [autoRefresh, fetchData]);
 
-  const getDriverLocation = (driverId) => {
-    return locations.find(loc => loc.userId === driverId);
+  const filterLocationsByDate = (logs, date) => {
+    if (!date || !logs) return logs;
+    
+    const selectedDateObj = new Date(date);
+    selectedDateObj.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDateObj);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    return logs.filter(log => {
+      let logDate;
+      
+      // Handle Firestore Timestamp object
+      if (log.timestamp && log.timestamp._seconds) {
+        logDate = new Date(log.timestamp._seconds * 1000);
+      } 
+      // Handle milliseconds timestamp
+      else if (typeof log.timestamp === 'number') {
+        logDate = new Date(log.timestamp);
+      }
+      // Handle Date string
+      else {
+        logDate = new Date(log.timestamp);
+      }
+      
+      const isInRange = logDate >= selectedDateObj && logDate < nextDay;
+      
+      return isInRange;
+    });
+  };
+
+  const getLatestLocation = (driverId) => {
+    const logs = driverLocations[driverId];
+    if (!logs || logs.length === 0) return null;
+    console.log(driverId, "Loc log:", logs)
+    
+    const filteredLogs = filterLocationsByDate(logs, selectedDate);
+    console.log(driverId, "Filtered logs", filteredLogs)
+    return filteredLogs.length > 0 ? filteredLogs[0] : null;
+  };
+
+  const getFilteredLocationHistory = (driverId) => {
+    const logs = driverLocations[driverId] || [];
+    return filterLocationsByDate(logs, selectedDate);
   };
 
   const getDriverDeliveries = (driverId) => {
@@ -151,17 +228,29 @@ const Map = () => {
 
   const isLocationRecent = (timestamp) => {
     if (!timestamp) return false;
-    const locationTime = timestamp._seconds ? timestamp._seconds * 1000 : new Date(timestamp).getTime();
+    
+    let locationTime;
+    if (timestamp._seconds) {
+      // Firestore Timestamp
+      locationTime = timestamp._seconds * 1000;
+    } else if (typeof timestamp === 'number') {
+      // Milliseconds
+      locationTime = timestamp;
+    } else {
+      // Date string or object
+      locationTime = new Date(timestamp).getTime();
+    }
+    
     const now = Date.now();
     const fiveMinutes = 5 * 60 * 1000;
     return (now - locationTime) < fiveMinutes;
   };
 
   const getDriverStatus = (driver) => {
-    const location = getDriverLocation(driver.id);
-    if (!location) return 'offline';
+    const latestLocation = getLatestLocation(driver.id);
+    if (!latestLocation) return 'offline';
     
-    const isRecent = isLocationRecent(location.timestamp);
+    const isRecent = isLocationRecent(latestLocation.timestamp);
     if (!isRecent) return 'offline';
     
     const hasActiveDeliveries = deliveries.some(
@@ -173,9 +262,29 @@ const Map = () => {
 
   const handleDriverClick = (driver) => {
     setSelectedDriver(driver);
-    const location = getDriverLocation(driver.id);
-    if (location) {
-      setMapCenter([location.latitude, location.longitude]);
+    const latestLocation = getLatestLocation(driver.id);
+    if (latestLocation) {
+      setMapCenter([latestLocation.latitude, latestLocation.longitude]);
+    }
+  };
+
+  const toggleDriverVisibility = (driverId) => {
+    setVisibleDrivers(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(driverId)) {
+        newSet.delete(driverId);
+      } else {
+        newSet.add(driverId);
+      }
+      return newSet;
+    });
+  };
+
+  const toggleAllDrivers = () => {
+    if (visibleDrivers.size === drivers.length) {
+      setVisibleDrivers(new Set());
+    } else {
+      setVisibleDrivers(new Set(drivers.map(d => d.id)));
     }
   };
 
@@ -193,7 +302,19 @@ const Map = () => {
 
   const formatTimestamp = (timestamp) => {
     if (!timestamp) return 'N/A';
-    const date = timestamp._seconds ? new Date(timestamp._seconds * 1000) : new Date(timestamp);
+    
+    let date;
+    if (timestamp._seconds) {
+      // Firestore Timestamp
+      date = new Date(timestamp._seconds * 1000);
+    } else if (typeof timestamp === 'number') {
+      // Milliseconds
+      date = new Date(timestamp);
+    } else {
+      // Date string or object
+      date = new Date(timestamp);
+    }
+    
     return date.toLocaleString('en-US', {
       month: 'short',
       day: 'numeric',
@@ -219,11 +340,18 @@ const Map = () => {
   const driversWithLocation = drivers
     .map(driver => ({
       ...driver,
-      location: getDriverLocation(driver.id),
+      latestLocation: getLatestLocation(driver.id),
+      locationHistory: getFilteredLocationHistory(driver.id),
       status: getDriverStatus(driver),
       deliveries: getDriverDeliveries(driver.id)
     }))
-    .filter(driver => driver.location && (showOffline || driver.status !== 'offline'));
+    .filter(driver => driver.latestLocation && (showOffline || driver.status !== 'offline'));
+
+  const visibleDriversWithLocation = driversWithLocation.filter(driver => 
+    visibleDrivers.has(driver.id)
+  );
+  console.log("vis driver:", driversWithLocation)
+  console.log("drivers", drivers)
 
   const onlineCount = driversWithLocation.filter(driver => driver.status !== 'offline').length;
   const deliveringCount = driversWithLocation.filter(driver => driver.status === 'delivering').length;
@@ -232,28 +360,61 @@ const Map = () => {
   return (
     <div className="h-screen flex flex-col">
       {/* Header */}
-      <div className="bg-white shadow-sm p-4 flex justify-between items-center">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-800">Live Tracking Map</h1>
-          <p className="text-sm text-gray-600">
-            Last updated: {formatTime(lastUpdate)}
-          </p>
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-3 text-sm">
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full bg-green-500"></div>
-              <span className="text-gray-700">{onlineCount} Online</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full bg-blue-500"></div>
-              <span className="text-gray-700">{deliveringCount} Delivering</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full bg-gray-400"></div>
-              <span className="text-gray-700">{offlineCount} Offline</span>
-            </div>
+      <div className="bg-white shadow-sm p-4">
+        <div className="flex justify-between items-center mb-3">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">Live Tracking Map</h1>
+            <p className="text-sm text-gray-600">
+              Last updated: {formatTime(lastUpdate)}
+            </p>
           </div>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3 text-sm">
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 rounded-full bg-green-500"></div>
+                <span className="text-gray-700">{onlineCount} Online</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 rounded-full bg-blue-500"></div>
+                <span className="text-gray-700">{deliveringCount} Delivering</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 rounded-full bg-gray-400"></div>
+                <span className="text-gray-700">{offlineCount} Offline</span>
+              </div>
+            </div>
+            <button
+              onClick={handleRefresh}
+              className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        {/* Filters Row */}
+        <div className="flex items-center gap-4 flex-wrap">
+          <div className="flex items-center gap-2">
+            <Calendar className="w-4 h-4 text-gray-600" />
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+            />
+          </div>
+          
+          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={showLocationHistory}
+              onChange={(e) => setShowLocationHistory(e.target.checked)}
+              className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+            />
+            Show history trail
+          </label>
+          
           <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
             <input
               type="checkbox"
@@ -263,13 +424,7 @@ const Map = () => {
             />
             Show offline
           </label>
-          <button
-            onClick={handleRefresh}
-            className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition"
-          >
-            <RefreshCw className="w-4 h-4" />
-            Refresh
-          </button>
+          
           <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
             <input
               type="checkbox"
@@ -279,6 +434,13 @@ const Map = () => {
             />
             Auto-refresh
           </label>
+
+          <button
+            onClick={toggleAllDrivers}
+            className="ml-auto text-sm text-blue-600 hover:text-blue-800 font-semibold"
+          >
+            {visibleDrivers.size === drivers.length ? 'Hide All' : 'Show All'}
+          </button>
         </div>
       </div>
 
@@ -286,7 +448,9 @@ const Map = () => {
         {/* Sidebar */}
         <div className="w-80 bg-white shadow-lg overflow-y-auto">
           <div className="p-4 border-b">
-            <h2 className="font-bold text-gray-800">Drivers ({driversWithLocation.length})</h2>
+            <h2 className="font-bold text-gray-800">
+              Drivers ({visibleDriversWithLocation.length}/{driversWithLocation.length} visible)
+            </h2>
           </div>
           
           {loading ? (
@@ -299,56 +463,72 @@ const Map = () => {
               <AlertCircle className="w-12 h-12 mx-auto mb-2 text-gray-400" />
               <p className="font-semibold">No drivers to display</p>
               <p className="text-sm mt-1">
-                {locations.length === 0 
+                {Object.keys(driverLocations).length === 0 
                   ? 'No location data available yet' 
-                  : 'Try enabling "Show offline" to see all drivers'}
+                  : `No location data for ${selectedDate}`}
               </p>
             </div>
           ) : (
             driversWithLocation.map((driver) => {
-              const isRecent = isLocationRecent(driver.location.timestamp);
+              const isVisible = visibleDrivers.has(driver.id);
+              const isRecent = isLocationRecent(driver.latestLocation.timestamp);
               
               return (
                 <div
                   key={driver.id}
-                  onClick={() => handleDriverClick(driver)}
-                  className={`p-4 border-b cursor-pointer transition ${
+                  className={`p-4 border-b transition ${
                     selectedDriver?.id === driver.id ? 'bg-blue-50 border-l-4 border-l-blue-600' : 'hover:bg-gray-50'
                   }`}
                 >
                   <div className="flex items-start justify-between mb-2">
-                    <div className="flex items-center gap-3">
+                    <div 
+                      className="flex items-center gap-3 flex-1 cursor-pointer"
+                      onClick={() => handleDriverClick(driver)}
+                    >
                       <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
                         <User className="w-6 h-6 text-blue-600" />
                       </div>
-                      <div>
-                        <h3 className="font-semibold text-gray-800">{driver.fullname}</h3>
+                      <div className="flex-1 min-w-0">
+                        <h3 className="font-semibold text-gray-800 truncate">{driver.fullname}</h3>
                         <p className="text-xs text-gray-500">{driver.phone}</p>
                       </div>
                     </div>
-                    <span className={`px-2 py-1 text-xs font-semibold rounded-full ${getStatusColor(driver.status)}`}>
-                      {driver.status}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className={`px-2 py-1 text-xs font-semibold rounded-full ${getStatusColor(driver.status)}`}>
+                        {driver.status}
+                      </span>
+                      <button
+                        onClick={() => toggleDriverVisibility(driver.id)}
+                        className={`p-1 rounded ${isVisible ? 'text-blue-600 bg-blue-100' : 'text-gray-400 bg-gray-100'} hover:opacity-80 transition`}
+                        title={isVisible ? 'Hide on map' : 'Show on map'}
+                      >
+                        {isVisible ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                      </button>
+                    </div>
                   </div>
 
                   <div className="ml-13 space-y-1 text-sm text-gray-600">
-                    {driver.location.speed && (
+                    <div className="flex items-center gap-2">
+                      <History className="w-3 h-3" />
+                      <span>{driver.locationHistory.length} points today</span>
+                    </div>
+                    {driver.latestLocation.speed !== undefined && (
                       <div className="flex items-center gap-2">
                         <Navigation className="w-3 h-3" />
-                        <span>{formatSpeed(driver.location.speed)}</span>
+                        <span>{formatSpeed(driver.latestLocation.speed)}</span>
                       </div>
                     )}
                     <div className="flex items-center gap-2">
                       <Clock className="w-3 h-3" />
                       <span className={!isRecent ? 'text-orange-600 font-semibold' : ''}>
-                        {formatTimestamp(driver.location.timestamp)}
+                        {formatTimestamp(driver.latestLocation.timestamp)}
                         {!isRecent && ' (old)'}
                       </span>
                     </div>
                     {driver.deliveries.length > 0 && (
                       <div className="flex items-center gap-2">
                         <Package className="w-3 h-3" />
-                        <span>{driver.deliveries.length} active deliveries</span>
+                        <span>{driver.deliveries.length} active</span>
                       </div>
                     )}
                   </div>
@@ -367,12 +547,12 @@ const Map = () => {
                 <p className="mt-4 text-gray-600">Loading map...</p>
               </div>
             </div>
-          ) : driversWithLocation.length === 0 ? (
+          ) : visibleDriversWithLocation.length === 0 ? (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-50">
               <div className="text-center">
                 <AlertCircle className="w-16 h-16 mx-auto mb-4 text-gray-400" />
-                <h3 className="text-xl font-semibold text-gray-800 mb-2">No Location Data</h3>
-                <p className="text-gray-600">Waiting for drivers to start sharing their location</p>
+                <h3 className="text-xl font-semibold text-gray-800 mb-2">No Drivers Visible</h3>
+                <p className="text-gray-600">Select drivers from the sidebar to view on map</p>
               </div>
             </div>
           ) : (
@@ -388,40 +568,65 @@ const Map = () => {
               />
               <RecenterMap center={mapCenter} />
 
-              {/* Driver Markers with Routes */}
-              {driversWithLocation.map((driver) => {
-                const driverDeliveries = driver.deliveries;
-                const routePoints = [
-                  [driver.location.latitude, driver.location.longitude],
-                  ...driverDeliveries
-                    .filter(delivery => delivery.destination)
-                    .map(delivery => {
-                      // Dummy coordinates near the driver for visualization
-                      const offset = Math.random() * 0.02;
-                      return [
-                        driver.location.latitude + offset,
-                        driver.location.longitude + offset
-                      ];
-                    })
-                ];
+              {/* Driver Location History and Markers */}
+              {visibleDriversWithLocation.map((driver) => {
+                const logs = driver.locationHistory;
+                
+                // Create polyline connecting all location points
+                const pathPoints = logs.map(log => [log.latitude, log.longitude]);
+
+                // Colors based on driver status
+                const pathColor = driver.status === 'delivering' ? '#3b82f6' : driver.status === 'online' ? '#10b981' : '#6b7280';
 
                 return (
                   <React.Fragment key={driver.id}>
-                    {/* Driver Marker */}
+                    {/* Path line connecting all locations - THICKER AND MORE VISIBLE */}
+                    {showLocationHistory && logs.length > 1 && (
+                      <Polyline
+                        positions={pathPoints}
+                        color={pathColor}
+                        weight={4}
+                        opacity={0.8}
+                      />
+                    )}
+
+                    {/* Show all location points as larger dots */}
+                    {showLocationHistory && logs.slice(1).map((log, index) => (
+                      <CircleMarker
+                        key={`${driver.id}-${index}`}
+                        center={[log.latitude, log.longitude]}
+                        radius={5}
+                        fillColor={pathColor}
+                        fillOpacity={0.8}
+                        color="white"
+                        weight={2}
+                      >
+                        <Popup>
+                          <div className="text-xs">
+                            <p className="font-semibold">{driver.fullname}</p>
+                            <p>{formatTimestamp(log.timestamp)}</p>
+                            {log.speed !== undefined && <p>Speed: {formatSpeed(log.speed)}</p>}
+                          </div>
+                        </Popup>
+                      </CircleMarker>
+                    ))}
+
+                    {/* Latest location (larger marker) */}
                     <Marker
-                      position={[driver.location.latitude, driver.location.longitude]}
-                      icon={createDriverIcon(driver.status)}
+                      position={[driver.latestLocation.latitude, driver.latestLocation.longitude]}
+                      icon={createDriverIcon(driver.status, true)}
                     >
                       <Popup>
                         <div className="p-2 min-w-[200px]">
                           <h3 className="font-bold text-gray-800 mb-2">{driver.fullname}</h3>
                           <div className="space-y-1 text-sm">
                             <p className="text-gray-600">Status: <span className={`font-semibold ${driver.status === 'online' ? 'text-green-600' : driver.status === 'delivering' ? 'text-blue-600' : 'text-gray-600'}`}>{driver.status}</span></p>
-                            {driver.location.speed && (
-                              <p className="text-gray-600">Speed: {formatSpeed(driver.location.speed)}</p>
+                            {driver.latestLocation.speed !== undefined && (
+                              <p className="text-gray-600">Speed: {formatSpeed(driver.latestLocation.speed)}</p>
                             )}
                             <p className="text-gray-600">Phone: {driver.phone}</p>
-                            <p className="text-gray-600 text-xs">Updated: {formatTimestamp(driver.location.timestamp)}</p>
+                            <p className="text-gray-600 text-xs">Updated: {formatTimestamp(driver.latestLocation.timestamp)}</p>
+                            <p className="text-gray-600 text-xs">Points today: {logs.length}</p>
                             {driver.deliveries.length > 0 && (
                               <div className="mt-2 pt-2 border-t">
                                 <p className="font-semibold text-gray-700 mb-1">Active Deliveries:</p>
@@ -437,23 +642,12 @@ const Map = () => {
                       </Popup>
                     </Marker>
 
-                    {/* Route Line */}
-                    {driver.deliveries.length > 0 && driver.status !== 'offline' && (
-                      <Polyline
-                        positions={routePoints}
-                        color={driver.status === 'delivering' ? '#3b82f6' : '#10b981'}
-                        weight={3}
-                        opacity={0.6}
-                        dashArray="10, 10"
-                      />
-                    )}
-
                     {/* Delivery Point Markers */}
-                    {driverDeliveries.map((delivery, idx) => {
+                    {driver.deliveries.map((delivery, idx) => {
                       const offset = Math.random() * 0.02;
                       const deliveryPos = [
-                        driver.location.latitude + offset,
-                        driver.location.longitude + offset
+                        driver.latestLocation.latitude + offset,
+                        driver.latestLocation.longitude + offset
                       ];
 
                       return (
@@ -492,7 +686,7 @@ const Map = () => {
       </div>
 
       {/* Selected Driver Info Panel */}
-      {selectedDriver && (
+      {selectedDriver && visibleDrivers.has(selectedDriver.id) && (
         <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 bg-white rounded-lg shadow-xl p-4 max-w-md z-[1000]">
           <div className="flex items-start justify-between mb-3">
             <div className="flex items-center gap-3">
@@ -522,19 +716,19 @@ const Map = () => {
             <div className="bg-gray-50 p-2 rounded">
               <p className="text-gray-600 text-xs">Speed</p>
               <p className="font-semibold text-gray-800">
-                {formatSpeed(getDriverLocation(selectedDriver.id)?.speed)}
+                {formatSpeed(getLatestLocation(selectedDriver.id)?.speed)}
               </p>
             </div>
             <div className="bg-gray-50 p-2 rounded">
-              <p className="text-gray-600 text-xs">Active Deliveries</p>
+              <p className="text-gray-600 text-xs">Points ({selectedDate})</p>
               <p className="font-semibold text-gray-800">
-                {getDriverDeliveries(selectedDriver.id).length}
+                {selectedDriver.locationHistory.length}
               </p>
             </div>
             <div className="bg-gray-50 p-2 rounded">
               <p className="text-gray-600 text-xs">Last Update</p>
               <p className="font-semibold text-gray-800 text-xs">
-                {formatTimestamp(getDriverLocation(selectedDriver.id)?.timestamp)}
+                {formatTimestamp(getLatestLocation(selectedDriver.id)?.timestamp)}
               </p>
             </div>
           </div>
@@ -543,5 +737,4 @@ const Map = () => {
     </div>
   );
 };
-
 export default Map;
